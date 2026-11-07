@@ -68,34 +68,37 @@ Open `https://YOUR_NAME.github.io/YOUR_REPO/#kiosk` and press F11 for full scree
 
 People tap **Ask SATARK** and talk, in Punjabi, Hindi, Bengali or English: "Sangrur kal?", "where is the smoke going?", "how accurate is this?". It answers out loud, using only the numbers on the page, and opens the village on the map.
 
-It uses OpenAI's realtime voice model, which is paid. A small free Cloudflare Worker holds your OpenAI key, so the key never goes into the website.
+It uses **Sarvam AI**, made in India for Indian languages: Saaras writes down what people say, Sarvam 105B works out the answer (it reads the forecast through the page's tools), and Bulbul speaks it, with its own Punjabi, Bengali, Hindi and English voices. It is paid per use. A small free Cloudflare Worker holds your Sarvam key, so the key never goes into the website.
 
-**A. OpenAI key**
+**A. Sarvam key**
 
-1. Go to https://platform.openai.com and sign in.
-2. **Settings → Billing**: add a small prepaid credit (for example $10).
-3. **Settings → Limits**: set a monthly budget, so it can never spend more than you planned.
-4. **API keys → Create new secret key**. Copy it (it's shown once). Don't paste it anywhere except step B3.
+1. Go to https://dashboard.sarvam.ai and sign up. New accounts get ₹100 of free credit.
+2. Add credit when you need it, and keep an eye on usage there.
+3. **API keys**: create a key (it starts with `sk_`). Copy it. Never put it in the code, a file in this repo, a chat or a screenshot: the repo is public, and anyone with the key can spend your credit. Its only place is step B3.
 
-**B. The key server (Cloudflare Worker, free)**
+**B. The voice server (Cloudflare Worker, free)**
 
 1. Go to https://dash.cloudflare.com and sign up (free plan).
-2. **Workers & Pages → Create**, and start from the "Hello World" Worker. Name it `satark-voice`, click **Deploy**, then **Edit code**. Delete everything in the editor, paste in the whole of `gis_prediction/risk_window/voice/worker.js`, and click **Deploy**.
+2. **Workers & Pages → Create**, and start from the "Hello World" Worker. Name it `satark-voice`, click **Deploy**, then **Edit code**. Delete everything in the editor, paste in the whole of `gis_prediction/risk_window/voice/worker.js`, and click **Deploy**. (If you already have the OpenAI Worker, just replace its code the same way.)
 3. Open the Worker → **Settings → Variables and Secrets → Add**:
-   - Type **Secret**, name `OPENAI_API_KEY`, value: your OpenAI key
-   - Type **Text**, name `ALLOWED_ORIGINS`, value: `https://YOUR_NAME.github.io` (add your own domain too, separated by a comma, if you use one)
-4. Copy the Worker's address, like `https://satark-voice.YOUR_NAME.workers.dev`. Opening it in a browser should say "SATARK voice key server is running."
+   - Type **Secret**, name `SARVAM_API_KEY`, value: your Sarvam key
+   - Type **Text**, name `ALLOWED_ORIGINS`, value: `https://YOUR_NAME.github.io` (add your own domain too, separated by a comma, if you use one). Required: without it the Worker refuses everyone.
+   - You can delete an old `OPENAI_API_KEY`; it isn't used any more.
+4. Copy the Worker's address, like `https://satark-voice.YOUR_NAME.workers.dev`. Opening it in a browser should say "SATARK voice server (Sarvam) is running."
 
 **C. Tell the website**
 
-1. GitHub: **Settings → Secrets and variables → Actions → Variables tab → New repository variable**: name `SATARK_VOICE_URL`, value: the Worker address.
+1. GitHub: **Settings → Secrets and variables → Actions → Variables tab → New repository variable**: name `SATARK_VOICE_URL`, value: the Worker address. (Already set if you used the OpenAI voice.)
 2. **Actions → Risk Window daily → Run workflow**. When it's green, the **Ask SATARK** button appears on the site.
 
 Good to know:
 
 - It works on the website link in Chrome, Edge or Safari, on phones too. The browser asks for the microphone the first time.
-- Cost is roughly ₹4 to ₹9 per minute of talking. For about a third of that, add a Worker variable `MODEL` = `gpt-realtime-mini` (a bit less natural in Punjabi and Bengali).
-- Each call ends after 3 minutes, and one device can start 12 calls an hour. The OpenAI budget limit from step A3 is the real safety net.
+- How a conversation goes: SATARK says hello, then listens. Talk, then pause: it sends your question by itself after about a second of quiet. Tap the circle to send early, to interrupt while it's speaking, or to talk again. **Pause** stops listening.
+- Each answer takes a few seconds (writing down, thinking, speaking). It is turn by turn, like a walkie-talkie, not a phone call.
+- Cost is roughly ₹1 to ₹2.5 per minute of talking (Sarvam's prices in November 2026: speech-to-text ₹0.49 a minute, Bulbul v4 Flash ₹1 per 1,000 characters, Sarvam 105B ₹15/₹60 per million tokens in/out).
+- Each call ends after 3 minutes, and one device can make 300 requests an hour (about 75 questions). Your Sarvam credit balance is the real safety net.
+- To change a voice, add a Worker variable `VOICES`, e.g. `{"pa-IN":"harpreet_pa_narration"}`, using names from Sarvam's Voices page. If a voice is refused, it falls back to the older Bulbul v3 voice by itself.
 - The page says clearly that people are talking to an AI.
 
 ### Sentinel-2 harvest, burn scars and population (Google Earth Engine)
@@ -131,6 +134,6 @@ To use something like `risk.satark.co.in`:
 - **A red run in the Actions tab.** Click it to see which step failed. A NASA or weather site being down for a day is normal. The next morning's run catches up.
 - **"Add the FIRMS_MAP_KEY secret first".** Step 2 was skipped or the name is misspelt.
 - **A new state doesn't show up yet.** Its data is still downloading. It appears by itself once it's complete, usually within a day or two.
-- **Ask SATARK says "could not connect".** Check the microphone permission, that `SATARK_VOICE_URL` is the Worker address, that `ALLOWED_ORIGINS` matches the site exactly (no slash at the end), and that the OpenAI account has credit.
+- **Ask SATARK says "could not connect" or "something went wrong".** Check the microphone permission, that `SATARK_VOICE_URL` is the Worker address, that `ALLOWED_ORIGINS` matches the site exactly, that `SARVAM_API_KEY` is set, and that your Sarvam account has credit. The message in brackets says which step failed (listening, thinking or speech).
 - **The push step fails with "permission denied".** **Settings → Actions → General → Workflow permissions → Read and write permissions**, then re-run.
 - **GitHub paused the daily workflow.** GitHub pauses scheduled runs in repos with no activity for 60 days. The robot commits every day, so this should not happen, but if it does: **Actions → Risk Window daily → Enable workflow**.

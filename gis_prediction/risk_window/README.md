@@ -161,7 +161,7 @@ On Sundays during the season it retrains and re-tests every extra signal, so onl
 | `gee/harvest_signal.js`, `import_harvest.py` | Optional Sentinel-2 harvest signal |
 | `harvest.py` | Sentinel-2 harvest and burn-scar signals, and population, through Earth Engine (optional) |
 | `smoke.py` | Where today's smoke drifts (wind paths) and PM2.5 for towns (CAMS) |
-| `voice/worker.js` | The Cloudflare Worker that keeps the OpenAI key safe for Ask SATARK |
+| `voice/worker.js` | The Cloudflare Worker for Ask SATARK: keeps the Sarvam key safe and relays speech, answers and voices |
 | `dashboard.py`, `dashboard_template.html` | The dashboard. The pilot regions are inside the page (works offline); big states load from `out/data/` |
 | `assets/` | SATARK logo, riso field photo and DIVA drawing used by the dashboard |
 | `SETUP.md` | One-time setup on GitHub |
@@ -174,6 +174,6 @@ On Sundays during the season it retrains and re-tests every extra signal, so onl
 - **Village names:** India Post All India Pincode Directory via data.gov.in (GODL-India). Some post office coordinates are rough, so treat the name as "near", not exact.
 - **Air quality forecast:** Copernicus Atmosphere Monitoring Service (CAMS), via Open-Meteo.
 - **Population:** GHS-POP R2023A, European Commission Joint Research Centre. **Land cover:** ESA WorldCover. **Imagery:** Copernicus Sentinel-2, via Google Earth Engine.
-- **Voice:** OpenAI realtime API, through your own key.
+- **Voice:** Sarvam AI (Saaras speech-to-text, Sarvam 105B, Bulbul voices), through your own key.
 
 Licensed GPL-3.0, same as SATARK PRIME.

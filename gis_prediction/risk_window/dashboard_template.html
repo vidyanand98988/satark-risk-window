@@ -166,6 +166,8 @@ details summary{cursor:pointer;color:var(--brand);font-size:13px;margin-top:8px}
 .orb::before,.orb::after{content:'';position:absolute;inset:-18px;border-radius:50%;border:2px solid rgba(255,181,17,.35);animation:ring 3s infinite}
 .orb::after{inset:-38px;border-color:rgba(239,230,210,.18);animation-delay:1.2s}
 @keyframes ring{0%{transform:scale(.92);opacity:.9}100%{transform:scale(1.12);opacity:0}}
+.orb{cursor:pointer}.orb.talk{animation:talk .55s ease-in-out infinite alternate}
+@keyframes talk{from{transform:scale(1)}to{transform:scale(1.09)}}
 .vo .vs{font:700 22px 'Kalam',cursive;color:var(--yel);min-height:30px;text-align:center}
 .vo .vt{width:min(640px,100%);max-height:32vh;overflow:auto;font-size:15.5px;line-height:1.5;display:flex;flex-direction:column;gap:8px}
 .vo .vt .u{align-self:flex-end;background:rgba(239,230,210,.12);padding:6px 12px;border-radius:12px 12px 2px 12px;max-width:85%}
@@ -238,8 +240,8 @@ body.kiosk .rp svg{max-height:80vh}
   <div class="orb" id="orb"></div>
   <div class="vs" id="vs">Connecting</div>
   <div class="vt" id="vt"></div>
-  <div class="vb"><button id="vmute">Mute mic</button><button class="end" id="vend">End</button></div>
-  <div class="vn">Talk in Punjabi, Hindi, Bengali or English. You are speaking to an AI. It reads the same forecast as this page and can be wrong. Calls end after 3 minutes.</div>
+  <div class="vb"><button id="vmute">Pause</button><button class="end" id="vend">End</button></div>
+  <div class="vn">Talk in Punjabi, Hindi, Bengali or English, then pause. Tap the circle to talk again or to interrupt. You are speaking to an AI (Sarvam). It reads the same forecast as this page and can be wrong. Calls end after 3 minutes.</div>
 </div>
 <script>
 const DATA = /*__DATA__*/null;
@@ -583,73 +585,157 @@ function startReplay(d){
   else if('IntersectionObserver' in window){ const ob=new IntersectionObserver(es=>{ if(es[0].isIntersecting){ ob.disconnect(); if(!RP.timer){RP.i=0; frame(0); play()} } },{threshold:.6}); ob.observe($('#rpcard')); }
 }
 
-/* ---- voice: OpenAI realtime, through SATARK's own key server (voice/worker.js). The AI only answers from
-   what the tools below read off this page, so its numbers are the forecast's numbers. ---- */
-const VOICE={pc:null, dc:null, stream:null, timer:null, raf:null, line:null, calls:[]};
+/* ---- voice: Ask SATARK on Sarvam AI, through SATARK's own voice server (voice/worker.js). The page records a
+   question, the server writes it down, thinks of a reply (calling the tools below for any number) and speaks it.
+   The AI only answers from what the tools read off this page, so its numbers are the forecast's numbers. ---- */
+const VOICE={on:false, state:'', stream:null, ac:null, an:null, rec:null, audio:null, timer:null, raf:null, msgs:[],
+             lang:'en-IN', paused:false, heard:false, drop:false, stopSpeak:null};
+const VAD={on:0.03, frames:5, quiet:1300, wait:9000, max:25000};   // mic level that counts as talking; pauses in ms
+const VLANG={en:'en-IN', hi:'hi-IN', pa:'pa-IN', bn:'bn-IN'};
 const lvlWord=p=>['low','medium','high','very high'][level(p)];
 const plain=h=>String(h||'').replace(/<[^>]+>/g,'');
 function initVoice(){
   const b=$('#ask'); if(!CFG.voice||!b) return;
   b.hidden=false; b.onclick=startVoice; $('#vend').onclick=()=>endVoice();
-  $('#vmute').onclick=()=>{ if(!VOICE.stream) return; const t=VOICE.stream.getAudioTracks()[0]; t.enabled=!t.enabled; $('#vmute').textContent=t.enabled?'Mute mic':'Unmute mic'; };
+  $('#vmute').onclick=()=>{ VOICE.paused=!VOICE.paused; $('#vmute').textContent=VOICE.paused?'Resume':'Pause';
+    if(VOICE.paused&&VOICE.rec){ VOICE.drop=true; VOICE.rec.stop(); }
+    if(VOICE.paused&&VOICE.state!=='thinking'&&VOICE.state!=='speaking') vstate('paused','Paused. Tap the circle to talk');
+    else if(!VOICE.paused&&VOICE.state==='paused') listen(); };
+  $('#orb').onclick=()=>{   // tap the circle: talk now, send now, or interrupt
+    if(!VOICE.on) return;
+    if(VOICE.state==='listening'&&VOICE.rec){ VOICE.heard=true; VOICE.rec.stop(); }
+    else if(VOICE.state==='speaking'&&VOICE.stopSpeak) VOICE.stopSpeak();
+    else if(VOICE.state==='paused'){ VOICE.paused=false; $('#vmute').textContent='Pause'; listen(); } };
 }
 function vsay(cls, text){ const el=document.createElement('div'); el.className=cls; el.textContent=text; $('#vt').appendChild(el); $('#vt').scrollTop=1e9; return el; }
+function vstate(s, label){ VOICE.state=s; $('#vs').textContent=label; $('#orb').classList.toggle('talk', s==='speaking'); if(s!=='listening') $('#orb').style.transform=''; }
+function silentWav(){   // phones only play sound a page starts from a tap; playing this on the tap unlocks the player
+  const n=160, b=new ArrayBuffer(44+n*2), v=new DataView(b), w=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));
+  w(0,'RIFF'); v.setUint32(4,36+n*2,true); w(8,'WAVEfmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,8000,true); v.setUint32(28,16000,true); v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,'data'); v.setUint32(40,n*2,true);
+  return URL.createObjectURL(new Blob([b],{type:'audio/wav'}));
+}
+async function vpost(path, body){
+  const blob=body instanceof Blob;
+  const r=await fetch(CFG.voice+path,{method:'POST', headers:{'Content-Type':blob?(body.type||'audio/webm'):'application/json'}, body:blob?body:JSON.stringify(body)});
+  let j={}; try{ j=await r.json() }catch(e){}
+  if(!r.ok) throw new Error(j.error||('voice server said '+r.status));
+  return j;
+}
 async function startVoice(){
-  if(VOICE.pc) return;
-  $('#vo').hidden=false; $('#vt').innerHTML=''; $('#vs').textContent='Connecting';
+  if(VOICE.on) return;
+  Object.assign(VOICE,{on:true, msgs:[], paused:false, lang:VLANG[LANG]||'en-IN'});
+  $('#vo').hidden=false; $('#vt').innerHTML=''; $('#vmute').textContent='Pause'; vstate('connecting','Connecting');
+  VOICE.audio=new Audio(); VOICE.audio.src=silentWav(); VOICE.audio.play().catch(()=>{});
   try{
-    const d=DATA[REG]||{};
-    const r=await fetch(CFG.voice+'/session',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({lang:LANG, region:d.label||'', date:d.date||'', regions:CFG.regions.map(x=>x[1])})});
-    if(!r.ok) throw new Error('key server said '+r.status);
-    const j=await r.json(), key=j.value||(j.client_secret&&j.client_secret.value); if(!key) throw new Error('no key from the key server');
-    const pc=new RTCPeerConnection(); VOICE.pc=pc;
-    const audio=document.createElement('audio'); audio.autoplay=true;
-    pc.ontrack=e=>{audio.srcObject=e.streams[0]; meter(e.streams[0])};
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); VOICE.stream=stream;
-    pc.addTrack(stream.getTracks()[0], stream);
-    const dc=pc.createDataChannel('oai-events'); VOICE.dc=dc;
-    dc.onmessage=e=>{try{onVoiceEvent(JSON.parse(e.data))}catch(x){console.log('[voice]',x)}};
-    dc.onopen=()=>{ $('#vs').textContent='Listening'; dc.send(JSON.stringify({type:'response.create'})); };   // it says hello first
-    const offer=await pc.createOffer(); await pc.setLocalDescription(offer);
-    const ans=await fetch('https://api.openai.com/v1/realtime/calls',{method:'POST',body:offer.sdp,headers:{Authorization:'Bearer '+key,'Content-Type':'application/sdp'}});
-    if(!ans.ok) throw new Error('voice service said '+ans.status);
-    await pc.setRemoteDescription({type:'answer', sdp:await ans.text()});
+    VOICE.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+    VOICE.ac=new (window.AudioContext||window.webkitAudioContext)(); VOICE.an=VOICE.ac.createAnalyser(); VOICE.an.fftSize=1024;
+    VOICE.ac.createMediaStreamSource(VOICE.stream).connect(VOICE.an);
     VOICE.timer=setTimeout(()=>endVoice('Time is up. Tap Ask SATARK to talk again.'), 180000);
+    const h=await vpost('/hello',{lang:LANG});   // it says hello first
+    if(!VOICE.on) return;
+    vsay('a', h.text); VOICE.msgs.push({role:'assistant', content:h.text});
+    await speak(h.audio, h.mime);
+    listen();
   }catch(e){ console.log('[voice]',e); endVoice('Could not connect ('+(e.message||e)+'). Allow the microphone and check the internet.'); }
 }
-function endVoice(msg){
-  clearTimeout(VOICE.timer); cancelAnimationFrame(VOICE.raf);
-  try{VOICE.dc&&VOICE.dc.close()}catch(e){} try{VOICE.pc&&VOICE.pc.close()}catch(e){}
-  if(VOICE.stream) VOICE.stream.getTracks().forEach(t=>t.stop());
-  Object.assign(VOICE,{pc:null,dc:null,stream:null,line:null,calls:[]});
-  $('#orb').style.transform='';
-  if(msg){ $('#vs').textContent=msg; setTimeout(()=>{if(!VOICE.pc) $('#vo').hidden=true},5000); } else $('#vo').hidden=true;
+function listen(){
+  if(!VOICE.on) return;
+  if(VOICE.paused) return vstate('paused','Paused. Tap the circle to talk');
+  const type=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus']
+    .find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||'';
+  let rec; try{ rec=new MediaRecorder(VOICE.stream, type?{mimeType:type}:undefined) }catch(e){ return endVoice('This browser cannot record sound. Try Chrome.') }
+  const chunks=[]; VOICE.rec=rec; VOICE.heard=false; VOICE.drop=false;
+  rec.ondataavailable=e=>{ if(e.data&&e.data.size) chunks.push(e.data) };
+  rec.onstop=()=>{
+    if(VOICE.rec===rec) VOICE.rec=null;
+    cancelAnimationFrame(VOICE.raf);
+    if(!VOICE.on||VOICE.drop) return;
+    if(!VOICE.heard) return vstate('paused',"I didn't hear anything. Tap the circle to talk");
+    turn(new Blob(chunks,{type:(rec.mimeType||type||'audio/webm').split(';')[0]}));
+  };
+  rec.start(250); vstate('listening','Listening');
+  const t0=performance.now(), buf=new Uint8Array(VOICE.an.fftSize); let last=t0, loud=0;
+  const tick=()=>{   // the circle breathes with the voice; recording stops on its own when the person stops talking
+    if(VOICE.rec!==rec) return;
+    VOICE.an.getByteTimeDomainData(buf); let s=0; for(const x of buf){ const v=(x-128)/128; s+=v*v }
+    const rms=Math.sqrt(s/buf.length), now=performance.now();
+    $('#orb').style.transform=`scale(${(1+Math.min(rms*5,0.5)).toFixed(3)})`;
+    if(rms>VAD.on){ if(++loud>=VAD.frames) VOICE.heard=true; last=now } else loud=0;
+    if((VOICE.heard&&now-last>VAD.quiet)||(!VOICE.heard&&now-t0>VAD.wait)||now-t0>VAD.max){ rec.stop(); return }
+    VOICE.raf=requestAnimationFrame(tick);
+  };
+  tick();
 }
-function meter(stream){   // the orb breathes with the voice
-  try{ const ac=new (window.AudioContext||window.webkitAudioContext)(), an=ac.createAnalyser(); an.fftSize=256;
-    ac.createMediaStreamSource(stream).connect(an); const buf=new Uint8Array(an.frequencyBinCount);
-    const tick=()=>{ if(!VOICE.pc) return; an.getByteFrequencyData(buf); let v=0; for(const x of buf) v+=x; v/=buf.length*255;
-      $('#orb').style.transform=`scale(${(1+v*1.1).toFixed(3)})`; VOICE.raf=requestAnimationFrame(tick)}; tick(); }catch(e){}
+async function turn(blob){
+  vstate('thinking','Thinking');
+  try{
+    const s=await vpost('/stt', blob); if(!VOICE.on) return;
+    const text=(s.transcript||'').trim();
+    if(!text){ vstate('thinking',"Sorry, I didn't catch that"); return setTimeout(listen, 900); }
+    vsay('u', text);
+    if(Object.values(VLANG).includes(s.language_code)) VOICE.lang=s.language_code;
+    const reply=await converse(text); if(!VOICE.on) return;
+    vsay('a', reply);
+    vstate('thinking','Thinking');
+    const t=await vpost('/tts',{text:reply, lang:scriptLang(reply)||VOICE.lang}); if(!VOICE.on) return;
+    await speak(t.audio, t.mime);
+  }catch(e){ console.log('[voice]',e); if(VOICE.on) vstate('paused','Something went wrong ('+(e.message||e)+'). Tap the circle to try again.'); return; }
+  listen();
 }
-function onVoiceEvent(ev){
-  const t=ev.type;
-  if(t==='input_audio_buffer.speech_started') $('#vs').textContent='Listening';
-  else if(t==='conversation.item.input_audio_transcription.completed'){ if(ev.transcript&&ev.transcript.trim()) vsay('u', ev.transcript.trim()); }
-  else if(t==='response.output_audio_transcript.delta'||t==='response.audio_transcript.delta'){ if(!VOICE.line) VOICE.line=vsay('a',''); VOICE.line.textContent+=ev.delta||''; $('#vs').textContent='Speaking'; $('#vt').scrollTop=1e9; }
-  else if(t==='response.output_audio_transcript.done'||t==='response.audio_transcript.done') VOICE.line=null;
-  else if(t==='response.function_call_arguments.done'){ $('#vs').textContent='Checking the forecast'; VOICE.calls.push(runTool(ev.name, ev.arguments, ev.call_id)); }
-  else if(t==='response.done'){
-    if(VOICE.calls.length){ const c=VOICE.calls; VOICE.calls=[]; Promise.all(c).then(()=>VOICE.dc&&VOICE.dc.send(JSON.stringify({type:'response.create'}))); }
-    else $('#vs').textContent='Listening';
+async function converse(text){
+  VOICE.msgs.push({role:'user', content:text}); trimMsgs();
+  const d=DATA[REG]||{}, ctx={lang:LANG, heard:VOICE.lang, region:d.label||'', date:d.date||'', regions:CFG.regions.map(x=>x[1])};
+  for(let i=0;i<4;i++){
+    const m=(await vpost('/chat',{...ctx, messages:VOICE.msgs})).message||{};
+    if(m.tool_calls&&m.tool_calls.length){
+      VOICE.msgs.push({role:'assistant', content:m.content||null, tool_calls:m.tool_calls});
+      vstate('thinking','Checking the forecast');
+      for(const c of m.tool_calls) VOICE.msgs.push({role:'tool', tool_call_id:c.id, content:JSON.stringify(await runTool(c.function.name, c.function.arguments))});
+      continue;
+    }
+    const say=String(m.content||'').trim()||"Sorry, I don't have an answer for that.";
+    VOICE.msgs.push({role:'assistant', content:say}); return say;
   }
-  else if(t==='error') console.log('[voice] error', ev.error);
+  return "Sorry, I couldn't finish that. Please ask again.";
 }
-async function runTool(name, args, id){
+function trimMsgs(){   // keep the last few questions, starting at one the person asked
+  const size=()=>VOICE.msgs.reduce((n,m)=>n+JSON.stringify(m).length,0);
+  while((VOICE.msgs.length>24||size()>24000)&&VOICE.msgs.length>1){
+    VOICE.msgs.shift(); while(VOICE.msgs.length>1&&VOICE.msgs[0].role!=='user') VOICE.msgs.shift();
+  }
+}
+function scriptLang(t){   // which voice to read the answer with, from the letters it is written in
+  const n={'pa-IN':/[਀-੿]/g,'bn-IN':/[ঀ-৿]/g,'hi-IN':/[ऀ-ॿ]/g};
+  let best=null, most=2; for(const [k,re] of Object.entries(n)){ const c=(t.match(re)||[]).length; if(c>most){ best=k; most=c } }
+  return best||(/[A-Za-z]/.test(t)?'en-IN':null);
+}
+function speak(b64, mime){
+  return new Promise(res=>{
+    if(!VOICE.on||!b64) return res();
+    const a=VOICE.audio; let done=false;
+    const fin=()=>{ if(done) return; done=true; VOICE.stopSpeak=null; a.onended=a.onerror=null; res() };
+    VOICE.stopSpeak=()=>{ try{a.pause()}catch(e){} fin() };
+    a.onended=a.onerror=fin; a.src='data:'+(mime||'audio/mpeg')+';base64,'+b64;
+    vstate('speaking','Speaking. Tap the circle to interrupt');
+    a.play().catch(e=>{ console.log('[voice] play', e); fin() });
+  });
+}
+function endVoice(msg){
+  VOICE.on=false; clearTimeout(VOICE.timer); cancelAnimationFrame(VOICE.raf);
+  try{ if(VOICE.rec){ VOICE.drop=true; VOICE.rec.stop() } }catch(e){}
+  try{ VOICE.stopSpeak&&VOICE.stopSpeak() }catch(e){}
+  if(VOICE.stream) VOICE.stream.getTracks().forEach(t=>t.stop());
+  try{ VOICE.ac&&VOICE.ac.close() }catch(e){}
+  Object.assign(VOICE,{state:'', stream:null, ac:null, an:null, rec:null, msgs:[]});
+  $('#orb').style.transform=''; $('#orb').classList.remove('talk');
+  if(msg){ $('#vs').textContent=msg; setTimeout(()=>{if(!VOICE.on) $('#vo').hidden=true},5000); } else $('#vo').hidden=true;
+}
+async function runTool(name, args){
   let a={}; try{a=JSON.parse(args||'{}')}catch(e){}
   let out; try{ out=await (VTOOLS[name]||(()=>({error:'unknown tool '+name})))(a) }catch(e){ out={error:String(e)} }
   console.log('[voice] tool', name, a, out);
-  if(VOICE.dc) VOICE.dc.send(JSON.stringify({type:'conversation.item.create', item:{type:'function_call_output', call_id:id, output:JSON.stringify(out)}}));
+  return out;
 }
 function regionByName(q){
   const n=norm(q||''); if(!n) return REG;
