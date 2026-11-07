@@ -108,7 +108,7 @@ This adds three things: fields already cut but not cleared, fresh burn scars (wh
 4. **IAM & Admin → Service accounts → Create service account** (name it `risk-window`). Give it two roles: **Earth Engine Resource Viewer** and **Service Usage Consumer**. No conditions.
 5. Open the new account → **Keys → Add key → Create new key → JSON**. A file downloads.
 6. In GitHub, add a secret `EE_SERVICE_ACCOUNT_KEY` and paste the whole file's text. Then delete the file.
-7. Run **Risk Window setup (run once)** again.
+7. Run **Risk Window setup (run once)** again. It reads every past season in one go. If you skip this, the daily run fills past seasons by itself, about 25 minutes' worth each morning, so it takes longer.
 
 ### Morning brief on Telegram
 

@@ -49,9 +49,10 @@ def _balanced(xy, lab, k, cap):
 MIN_P = 0.05   # never send a team to a place with less than a 5% chance of fire
 
 
-def plan(pred, teams=5, stops=4, spacing=2, min_p=MIN_P):
-    """Returns stops with a team number and visit order, plus a short summary."""
-    pts = pick(pred[pred.p >= min_p], teams * stops, spacing)
+def plan(pred, teams=5, stops=4, spacing=2, min_p=MIN_P, by="p"):
+    """Returns stops with a team number and visit order, plus a short summary.
+    by: what to rank places by ("p" chance, or "rank", the ranking chosen for the region)."""
+    pts = pick(pred[pred.p >= min_p], teams * stops, spacing, by=by if by in pred else "p")
     total = float(pred.mu.sum())
     if len(pts) == 0:
         return pts.assign(team=[], order=[]), {"teams": 0, "stops": 0, "expected_fires_total": round(total, 1),

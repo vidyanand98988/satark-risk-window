@@ -19,7 +19,7 @@ def pct(p):
     return f"{round(p * 100):d}%"
 
 
-def make(region_label, lang, day, pred, stops, summary, score=None, ahead=None):
+def make(region_label, lang, day, pred, stops, summary, score=None, ahead=None, weak=False):
     by_dist = pred.groupby("district").mu.sum().sort_values(ascending=False)
     hot = [d for d, v in by_dist.items() if v >= 0.5][:4]
     L = []
@@ -47,6 +47,9 @@ def make(region_label, lang, day, pred, stops, summary, score=None, ahead=None):
     if ahead:
         L.append("")
         L.append("Next days: " + "; ".join(f"{lab} about {round(v)} detections" for lab, v in ahead))
+    if weak:
+        L.append("Note: tested blind on last season, this forecast did no better than a simple guess "
+                 "(where it burned yesterday, or where it usually burns). Use the list as a guide.")
     L.append("Support first. Enforcement last.")
     loc = LOCAL.get(lang)
     if loc:

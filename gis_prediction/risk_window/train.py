@@ -15,6 +15,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
 from config import DATA, MODELS, REGIONS, FIRST_YEAR
 import grid, features as F
@@ -67,14 +68,20 @@ def build(region, years, pool, fires, wx, cells, cubes, dayss, h=1, aux=None):
     return pd.concat([F.season_rows(region, y, cubes[y], dayss[y], cells, cubes, pool, wx, h=h, aux=aux.get(y)) for y in years], ignore_index=True)
 
 
+SETTINGS = {   # gradient-boosting settings; "bigger" is kept for a region only if it helps on the check season
+    "standard": dict(max_iter=300, learning_rate=0.06, max_leaf_nodes=31, min_samples_leaf=80, l2_regularization=1.0, random_state=0),
+    "bigger": dict(max_iter=700, learning_rate=0.03, max_leaf_nodes=63, min_samples_leaf=200, l2_regularization=3.0, random_state=0),
+}
+
+
 def choose_groups(region, years, fires, wx, cells, cubes, dayss, aux, groups):
-    """Try each extra signal on the second-to-last season (never the test season). Keep it only if it helps."""
+    """Try each extra signal on the second-to-last season (never the test season). Keep it only if it helps.
+    Then, the same way: bigger settings or not, and whether to rank places by chance or by expected fires."""
     tr_y, va_y = years[:-2], years[-2]
     tr = build(region, tr_y, tr_y, fires, wx, cells, cubes, dayss, 1, aux)
     va = build(region, [va_y], tr_y, fires, wx, cells, cubes, dayss, 1, aux)
     def score(feats):
-        clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_leaf_nodes=31, min_samples_leaf=80,
-                                             l2_regularization=1.0, random_state=0).fit(tr[feats], (tr.y > 0).astype(int))
+        clf = HistGradientBoostingClassifier(**SETTINGS["standard"]).fit(tr[feats], (tr.y > 0).astype(int))
         p = clf.predict_proba(va[feats])[:, 1]
         return topk_scores(va, p)["catch@50"], average_precision_score(va.y > 0, p)
     base_c, base_ap = score(F.BASE)
@@ -91,6 +98,20 @@ def choose_groups(region, years, fires, wx, cells, cubes, dayss, aux, groups):
         if ok:
             keep.append(g)
     log["kept"] = keep
+    # settings and ranking: catch@50 must rise by half a point, and flagged-places-that-burned may not drop by more than 3
+    feats = F.BASE + [f for g in keep for f in F.EXTRA[g]]
+    opts = {}
+    for st in SETTINGS:
+        p, mu = predict(fit(tr[feats], tr.y, st), va[feats])
+        for rb, s in (("chance", p), ("expected", mu)):
+            opts[(st, rb)] = topk_scores(va, s)
+            print(f"  {st:8} ranked by {rb:8}  catch@50 {opts[(st, rb)]['catch@50']:.3f}  precision@50 {opts[(st, rb)]['precision@50']:.3f}")
+    base = opts[("standard", "chance")]
+    ok = [k for k, v in opts.items() if v["catch@50"] >= base["catch@50"] + 0.005 and v["precision@50"] >= base["precision@50"] - 0.03]
+    best = max(ok, key=lambda k: opts[k]["catch@50"]) if ok else ("standard", "chance")
+    log["settings"], log["rank_by"] = best
+    log["ranking_tests"] = {f"{a}, ranked by {b}": {m: v[m] for m in ("catch@50", "precision@50", "catch@100")} for (a, b), v in opts.items()}
+    print(f"  using {best[0]} settings, places ranked by {best[1]}")
     return keep, log
 
 
@@ -129,21 +150,47 @@ def daily_table(df, p, mu, base, k=50):
     return rows
 
 
-def fit(X, y):
-    clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_leaf_nodes=31, min_samples_leaf=80,
-                                         l2_regularization=1.0, random_state=0)
-    clf.fit(X, (y > 0).astype(int))
-    reg = HistGradientBoostingRegressor(loss="poisson", max_iter=300, learning_rate=0.06, max_leaf_nodes=31,
-                                        min_samples_leaf=80, l2_regularization=1.0, random_state=0)
-    reg.fit(X, y)
-    return clf, reg
+def fit(X, y, settings="standard"):
+    """Two parts: the chance of any fire, and how many detections if there is one.
+    Expected detections = chance x size. (A single Poisson count model ran away to numbers
+    like 1e19 in Rajasthan: scikit-learn's Poisson boosting has no step limit.)"""
+    P = SETTINGS[settings]
+    clf = HistGradientBoostingClassifier(**P).fit(X, (y > 0).astype(int))
+    pos = (y > 0).to_numpy()
+    size = HistGradientBoostingRegressor(loss="poisson", **P).fit(X[pos], y[pos])
+    cap = float(np.quantile(y[pos], 0.999))   # never more per cell than almost any fire day in training
+    return {"clf": clf, "size": size, "cap": cap}
 
 
-def replay(te, p, k=50, max_cells=140, min_p=0.08):
+def calibrator(p, y):
+    """Learns, on a season the model did not train on, how often fires really came for each chance it gave.
+    Never above 95%: a forecast is a chance, not a certainty."""
+    return IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=0.95).fit(p, (np.asarray(y) > 0).astype(int))
+
+
+def predict(m, X):
+    """(chance of a fire, expected detections) for each row. The chance is adjusted to be honest when the
+    model has a calibrator; the tiny extra term keeps the places in exactly the model's own order."""
+    p = m["clf"].predict_proba(X)[:, 1]
+    if "iso" in m:
+        p = np.clip(m["iso"].predict(p) + 1e-6 * p, 0, 0.951)
+    if "size" in m:
+        return p, p * np.clip(m["size"].predict(X), 1, m["cap"])
+    return p, np.minimum(m["reg"].predict(X), p * 40)   # model file from before the fix: keep the count in bounds
+
+
+def cal_table(p, y):
+    bins = np.array([0, .05, .1, .2, .3, .5, .7, 1.01])
+    cal = pd.DataFrame({"p": p, "y": (np.asarray(y) > 0).astype(int)}).assign(b=lambda x: pd.cut(x.p, bins)).groupby("b", observed=True).agg(
+        said=("p", "mean"), saw=("y", "mean"), n=("y", "size"))
+    return [{"said": round(float(r.said), 3), "saw": round(float(r.saw), 3), "n": int(r.n)} for r in cal.itertuples()]
+
+
+def replay(te, p, rank=None, k=50, max_cells=140, min_p=0.08):
     """The test season, day by day: where fires were seen, and where the model said to look (it never saw this season)."""
     out = {"k": k, "days": []}
-    for d, g in te.assign(pp=p).groupby("date"):
-        g = g.sort_values("pp", ascending=False)
+    for d, g in te.assign(pp=p, _r=p if rank is None else rank).groupby("date"):
+        g = g.sort_values("_r", ascending=False)
         top = g.head(k)
         fires = g[g.y > 0]
         risk = g[g.pp >= min_p].head(max_cells)
@@ -183,40 +230,57 @@ def main(region, today=None, select=False, replay_only=False):
         groups, glog = choose_groups(region, years, fires, wx, cells, cubes, dayss, aux, available_groups(fires, wx, harvest))
         MODELS.mkdir(parents=True, exist_ok=True); gpath.write_text(json.dumps(glog, indent=1))
     else:
-        groups = json.loads(gpath.read_text())["kept"] if gpath.exists() else []
+        glog = json.loads(gpath.read_text()) if gpath.exists() else {}
+        groups = glog.get("kept", [])
+    settings, rank_by = glog.get("settings", "standard"), glog.get("rank_by", "chance")
     feats = F.BASE + [f for g in groups for f in F.EXTRA[g]]
     test_year, train_years = years[-1], years[:-1]
-    print(f"{REGIONS[region]['label']}: train on {train_years}, test on {test_year}; extra signals: {groups or 'none'}")
+    print(f"{REGIONS[region]['label']}: train on {train_years}, test on {test_year}; extra signals: {groups or 'none'}; "
+          f"{settings} settings, places ranked by {rank_by}")
+    ranking = lambda p, mu: mu if rank_by == "expected" else p
 
     report = {"region": region, "label": REGIONS[region]["label"], "train_seasons": train_years, "test_season": test_year,
-              "cells": int(len(cells)), "static_cells_ignored": len(static), "extra_signals": groups, "horizons": {}}
+              "cells": int(len(cells)), "static_cells_ignored": len(static), "extra_signals": groups,
+              "settings": settings, "rank_by": rank_by, "horizons": {}}
     if gpath.exists():
         report["signal_tests"] = json.loads(gpath.read_text())
+    isos = {}
     for h in ((1,) if replay_only else HORIZONS):
         tr = build(region, train_years, train_years, fires, wx, cells, cubes, dayss, h, aux)
         te = build(region, [test_year], train_years, fires, wx, cells, cubes, dayss, h, aux)
-        clf, reg = fit(tr[feats], tr.y)
-        p, mu = clf.predict_proba(te[feats])[:, 1], reg.predict(te[feats])
+        m = fit(tr[feats], tr.y, settings)
+        p, mu = predict(m, te[feats])
+        isos[h] = calibrator(p, te.y)   # the final model's chance adjustment, learned on a season this model never saw
         base = baselines(te)
-        hr = {"model": evaluate(te, p)} | {n: evaluate(te, s) for n, s in base.items()}
+        hr = {"model": evaluate(te, ranking(p, mu))} | {n: evaluate(te, s) for n, s in base.items()}
         report["horizons"][str(h)] = hr
         print(f"  h={h} ({['today', 'tomorrow', 'day after'][h - 1]}): prec@50 {hr['model']['precision@50']:.2f} vs yesterday-guess "
-              f"{hr['persistence']['precision@50']:.2f}; catch@50 {hr['model']['catch@50']:.2f} vs {hr['persistence']['catch@50']:.2f}")
+              f"{hr['persistence']['precision@50']:.2f}; catch@50 {hr['model']['catch@50']:.2f} vs {hr['persistence']['catch@50']:.2f}"
+              f" and usual-places {hr['climatology']['catch@50']:.2f}")
         if h == 1:
+            # honest check of the adjustment, done the same way it is used: learned on the season before, applied to this one
+            tr0 = build(region, train_years[:-1], train_years[:-1], fires, wx, cells, cubes, dayss, h, aux)
+            va0 = build(region, [train_years[-1]], train_years[:-1], fires, wx, cells, cubes, dayss, h, aux)
+            iso0 = calibrator(predict(fit(tr0[feats], tr0.y, settings), va0[feats])[0], va0.y)
+            del tr0, va0
+            pa, mua = predict(m | {"iso": iso0}, te[feats])
             report |= {"test_cell_days": int(len(te)), "test_fires": int(te.y.sum()), "share_cell_days_with_fire": float((te.y > 0).mean())}
             report |= {k: hr[k] for k in ("model", "persistence", "climatology")}
-            te2 = te.assign(_mu=mu).merge(cells[["iy", "ix", "district"]].reset_index(drop=True), on=["iy", "ix"])
+            beats = all(hr["model"][k] > hr[b][k] for b in ("persistence", "climatology") for k in ("precision@50", "catch@50"))
+            report["beats_both_guesses"] = bool(beats)
+            if not beats:
+                print("  WARNING: the model does not beat both simple guesses on the test season (see README)")
+            te2 = te.assign(_mu=mua).merge(cells[["iy", "ix", "district"]].reset_index(drop=True), on=["iy", "ix"])
             dd = te2.groupby(["date", "district"]).agg(actual=("y", "sum"), pred=("_mu", "sum"), yday=("dist_lag1", "first")).reset_index()
             busy = dd[dd.actual + dd.yday > 0]
             report["district_totals"] = {"model_mae": float((busy.pred - busy.actual).abs().mean()),
                                          "yesterday_mae": float((busy.yday - busy.actual).abs().mean()),
                                          "model_corr": float(np.corrcoef(busy.pred, busy.actual)[0, 1])}
-            bins = np.array([0, .05, .1, .2, .3, .5, .7, 1.01])
-            cal = pd.DataFrame({"p": p, "y": (te.y > 0).astype(int)}).assign(b=lambda x: pd.cut(x.p, bins)).groupby("b", observed=True).agg(said=("p", "mean"), saw=("y", "mean"), n=("y", "size"))
-            report["calibration"] = [{"said": round(float(r.said), 3), "saw": round(float(r.saw), 3), "n": int(r.n)} for r in cal.itertuples()]
-            report["backtest_daily"] = daily_table(te, p, mu, base["persistence"])
+            report["calibration"] = cal_table(pa, te.y)                       # chances as the daily run now gives them
+            report["calibration_before_adjustment"] = cal_table(p, te.y)
+            report["backtest_daily"] = daily_table(te, ranking(pa, mua), mua, base["persistence"])
             MODELS.mkdir(parents=True, exist_ok=True)
-            (MODELS / f"{region}_replay.json").write_text(json.dumps(replay(te, p), separators=(",", ":")))
+            (MODELS / f"{region}_replay.json").write_text(json.dumps(replay(te, pa, ranking(pa, mua)), separators=(",", ":")))
             if replay_only:
                 print(f"Wrote the {test_year} replay"); return report
     report["generated"] = str(today)
@@ -225,10 +289,12 @@ def main(region, today=None, select=False, replay_only=False):
     models = {}
     for h in HORIZONS:
         full = build(region, years, years, fires, wx, cells, cubes, dayss, h, aux)
-        models[h] = dict(zip(("clf", "reg"), fit(full[feats], full.y)))
+        models[h] = fit(full[feats], full.y, settings) | {"iso": isos[h]}
+        del full
     MODELS.mkdir(parents=True, exist_ok=True)
     with open(MODELS / f"{region}.pkl", "wb") as fh:
         pickle.dump({"h": models, "features": feats, "groups": groups, "seasons": years, "trained": str(today),
+                     "settings": settings, "rank_by": rank_by,
                      "static": sorted(static), "cells": sorted(active) if active is not None else None}, fh)
     (MODELS / f"{region}_report.json").write_text(json.dumps(report, indent=1))
     m, ps = report["model"], report["persistence"]

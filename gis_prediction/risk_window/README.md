@@ -29,8 +29,8 @@ The three big states only model the 5 km areas that have burned before (and thei
 
 1. **Data.** NASA FIRMS VIIRS fire detections (375 m, S-NPP and NOAA-20), plus daily weather from Open-Meteo for points 0.5° apart.
 2. **Features, per cell per day.** Fires in the cell and its neighbours over the last 1 to 7 days, district and region trends, where fires usually are at this point in the season (from past years), how much of the cell's usual burning has already happened, and today's rain, humidity, heat and wind.
-3. **Model.** Gradient-boosted trees (scikit-learn), one for "will there be a fire" and one for "how many".
-4. **Plan.** Picks the riskiest places (never two next to each other, never below a 5% chance), splits them into teams by area, and orders each team's route.
+3. **Model.** Gradient-boosted trees (scikit-learn): one for "will there be a fire" and one for "how many, if it burns". Expected fires = chance × how many. The chances are then adjusted on a season the model never trained on, so that "20%" really means about one day in five.
+4. **Plan.** Picks the top places (never two next to each other, never below a 5% chance), splits them into teams by area, and orders each team's route. Places are ranked by chance, or by expected fires where that caught more fires on the check season (see below).
 5. **Check.** Next morning, compares yesterday's 50 flagged places with the satellite detections.
 
 ## How good is it
@@ -54,17 +54,27 @@ If the model can't beat both, don't use it to send people anywhere.
 
 - **This season (2026), which the model never saw:** over 47 days with fires, its 50 places held 19% of all fires seen. The "yesterday" guess held 13%.
 - **What 50 places means:** that's 1.4% of the map, so the flagged places hold far more than their share of fires.
-- **Calibration:** when it says 7%, fires came about 6% of the time; at 14%, about 13%; at 24%, about 20%.
+- **Calibration:** the chances are adjusted on the season before and checked on 2025. When it says 8%, fires came about 10% of the time; at 14%, about 18%; at 24%, about 27%; at 34%, about 36%. Without the adjustment it was too sure of itself at the top: 37% meant about 27%, and 56% about 37%.
 
 **Purba Medinipur**: 500 cells, 2,742 detections in the test season.
 
 | | Flagged places that burned (top 50) | Fires caught in top 50 | Fires caught in top 100 |
 |---|---|---|---|
-| **Risk Window** | **19%** | **63%** | **81%** |
+| **Risk Window** | **19%** | **61%** | **82%** |
 | Where it burned yesterday | 18% | 59% | 76% |
 | Where it usually burns | 18% | 61% | 78% |
 
-In Purba Medinipur the gain is small, so treat it as a planning aid, not a big upgrade. Burning there peaks from late November into December.
+In Purba Medinipur the gain is small (it ties "where it usually burns" in the top 50), so treat it as a planning aid, not a big upgrade. The morning brief says so. Burning there peaks from late November into December.
+
+**Rajasthan**: 4,356 cells, 8,614 detections in the test season. Burning here comes back to the same fields every year, so places are ranked by expected fires and the bigger settings are used (both chosen on the 2024 check).
+
+| | Flagged places that burned (top 50) | Fires caught in top 50 | Fires caught in top 100 |
+|---|---|---|---|
+| **Risk Window** | **26%** | **44%** | **61%** |
+| Where it burned yesterday | 20% | 22% | 37% |
+| Where it usually burns | 18% | 38% | 51% |
+
+Before this, ranked by chance, it caught 33% in the top 50 and lost to "where it usually burns".
 
 ### Looking ahead (tested blind on 2025)
 
@@ -78,7 +88,7 @@ The gap over the simple guess holds, and in Purba Medinipur it grows, for the da
 
 ### Extra signals: tested, kept only if they help
 
-`train.py --select` tests each extra signal on the season before the test season and keeps it only if it helps:
+`train.py --select` tests each extra signal on the season before the test season and keeps it only if it helps. The same check, on the same season, decides two more things per region: bigger, slower model settings or the standard ones, and whether places are ranked by chance or by expected fires. Each is kept only if it catches at least half a point more fires in the top 50 without losing more than 3 points of flagged places that burned. `train.py` also prints a warning, and writes `beats_both_guesses: false` in the report, if a region's model doesn't beat both simple guesses on the test season.
 
 - **Punjab and Haryana:** the third VIIRS satellite (NOAA-21), fire intensity and Diwali timing were tested and none helped, so none are used.
 - **Purba Medinipur:** NOAA-21 and fire intensity helped on the 2024 check and are used.
@@ -86,7 +96,7 @@ The gap over the simple guess holds, and in Purba Medinipur it grows, for the da
 **Two more signals switch on by themselves:**
 
 1. **MODIS and wind direction.** The one-time setup workflow downloads them, and `train.py --select` tests them.
-2. **Harvest from Sentinel-2.** This marks fields already cut but not yet cleared. With an Earth Engine service account (see `SETUP.md`), `harvest.py` reads it every morning and backfills past seasons once. Without one, it is skipped. The manual route still works: run `gee/harvest_signal.js` in the Earth Engine Code Editor, then `python import_harvest.py harvest_*.csv`.
+2. **Harvest from Sentinel-2.** This marks fields already cut but not yet cleared. With an Earth Engine service account (see `SETUP.md`), `harvest.py` reads it every morning, then spends up to 25 minutes filling past seasons (2022 onwards, newest first), carrying on the next morning until all are in. The setup run fills them all in one go. Progress is kept in `data/harvest_done.json`. Once past seasons are in, the Sunday retrain tests the signal. Without an account, it is skipped. The manual route still works: run `gee/harvest_signal.js` in the Earth Engine Code Editor, then `python import_harvest.py harvest_*.csv`.
 
 **Factories, flares and power plants removed.** 120 cells in Punjab and Haryana and 10 in Purba Medinipur were dropped because they fire up at night or nearly every day. They are industrial heat sources, not farms. In Purba Medinipur they made up about half of all raw detections. Night detections are ignored everywhere.
 

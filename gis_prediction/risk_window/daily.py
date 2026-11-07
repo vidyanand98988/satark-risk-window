@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 from config import ROOT, DATA, OUT, MODELS, REGIONS, ORDER, CELL, SENSORS, WX_DAILY
-import grid, features as F, dispatch, brief, sources, smoke
+import grid, features as F, dispatch, brief, sources, smoke, train
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -101,8 +101,9 @@ def predict_season(region, today, fires, wx, cells, model, harvest=None, backfil
             continue
         first = days[max(h, 1)] if (backfill and h == 1) else target
         rows = F.season_rows(region, year, cubes[year], days, cells, cubes, others, wx, last_day=target, h=h, aux=aux, first_day=first)
-        rows["p"] = m["clf"].predict_proba(rows[feats])[:, 1]
-        rows["mu"] = m["reg"].predict(rows[feats])
+        rows["p"], rows["mu"] = train.predict(m, rows[feats])
+        # what places are ranked by (chosen per region on the check season): chance, or expected fires
+        rows["rank"] = rows.mu if model.get("rank_by") == "expected" else rows.p
         rows["h"] = h
         out.append(rows)
     rows = pd.concat(out, ignore_index=True).merge(cells[["iy", "ix", "lat", "lon", "district"]].reset_index(drop=True), on=["iy", "ix"])
@@ -112,7 +113,7 @@ def predict_season(region, today, fires, wx, cells, model, harvest=None, backfil
 def score_day(g, k=50):
     """How did the forecast for one day do once the satellites came in?"""
     tot = float(g.y.sum())
-    top = g.sort_values("p", ascending=False).head(k)
+    top = g.sort_values("rank", ascending=False).head(k)
     pers = (g.lag1 * 100 + g.nb1_lag1 * 10 + g.sum7 + 0.01 * g.clim)
     ptop = g.assign(_s=pers).sort_values("_s", ascending=False).head(k)
     by_d = g.groupby("district").agg(pred=("mu", "sum"), actual=("y", "sum")).sort_values("actual", ascending=False)
@@ -224,9 +225,10 @@ def run_region(region, today, teams, stops, backfill, live):
     yday = sb[sb.date == str(today - timedelta(days=1))].astype(object).where(lambda x: pd.notna(x), None).to_dict("records") if "date" in sb else []
     yscore = yday[0] if yday else None
 
-    plan, summary = dispatch.plan(pred, teams, stops)
+    plan, summary = dispatch.plan(pred, teams, stops, by="rank")
     ahead_tot = [(["today", "tomorrow", "day after"][h - 1], float(g.mu.sum())) for h, g in ahead.items() if h > 1]
-    text = brief.make(reg["label"], reg["lang"], today, pred, plan, summary, yscore, ahead_tot)
+    weak = bool(report) and report.get("beats_both_guesses") is False
+    text = brief.make(reg["label"], reg["lang"], today, pred, plan, summary, yscore, ahead_tot, weak=weak)
     (od / f"brief_{today}.txt").write_text(text)
 
     w, s, e, n = reg["bbox"]
@@ -243,13 +245,13 @@ def run_region(region, today, teams, stops, backfill, live):
     labels = {1: "today", 2: "tomorrow", 3: "day after"}
 
     def day_block(g, h):
-        cand = g.sort_values("p", ascending=False).head(400)
+        cand = g.sort_values("rank", ascending=False).head(400)   # the dashboard plans teams in this order
         return {"h": int(h), "label": labels[h], "date": str(g.date.iloc[0]), "total_mu": round(float(g.mu.sum()), 1),
                 "risk": [[int(r.iy), int(r.ix), round(float(r.p), 3), round(float(r.mu), 2), di_of[r.district]] for r in g.itertuples() if r.p >= 0.005],
                 "candidates": [[int(r.iy), int(r.ix), round(float(r.lat), 4), round(float(r.lon), 4), r.district, round(float(r.p), 3), round(float(r.mu), 2), r.place] for r in cand.itertuples()],
                 "districts": [[d, round(float(v), 1)] for d, v in g.groupby("district").mu.sum().sort_values(ascending=False).head(8).items()]}
     dayblocks = [day_block(g, h) for h, g in ahead.items()]
-    cand = pred.sort_values("p", ascending=False).head(400)
+    cand = pred.sort_values("rank", ascending=False).head(400)
     latest = {
         "region": region, "label": reg["label"], "lang": reg["lang"], "date": str(today), "in_season": True,
         "bbox": reg["bbox"], "cell": CELL, "season_day": di + 1, "season_len": len(days),
